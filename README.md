@@ -1,17 +1,21 @@
 # icc-cloudflare-probe
 
-Minimal reproducer demonstrating that the public ICC profile registry at
-**`registry.color.org/profile-registry/`** is currently gated by a
-Cloudflare bot-challenge that blocks all non-browser HTTP clients
-(Node, curl, wget, Python `requests`, etc.).
+Cross-client diagnostic for the Cloudflare bot rule sitting in front of
+the public ICC profile registry at **`registry.color.org/profile-registry/`**.
 
-The challenge serves an HTML page that requires browser-side JavaScript
-to compute a clearance cookie. No HTTP-only client can pass it.
+The rule on this hostname is **volatile** — its behaviour has shifted
+substantially within the span of a single day during the development of
+this very tool (see [history](#observed-history) below). Today's
+pass-list is not necessarily tomorrow's. The point of this probe is to
+give a date-stamped snapshot of which standard HTTP clients fail
+*right now*, plus a record of what the rule has done historically.
 
 ## Run
 
-Requires Node ≥ 18 (uses global `fetch`). Zero npm dependencies — no
-`npm install` needed.
+Requires Node ≥ 18. Zero npm dependencies. Optionally also detects and
+shells out to `curl`, `wget`, and `python3` if they're on `PATH` —
+each is independently optional, the probe just skips the rows for any
+that aren't installed.
 
 ```
 node probe.mjs
@@ -32,43 +36,52 @@ node probe.mjs --url https://registry.color.org/profile-registry/<NAME>.icc
 
 ## What it does
 
-Issues GET requests to one URL using a range of header sets:
+Issues two GET requests per available client to the target URL:
 
-1. Bare (no `User-Agent` override — Node's default)
-2. curl-like (`curl/8.4.0`)
-3. Firefox `User-Agent` only
-4. Full Firefox header set (`User-Agent` + `Accept` + `Sec-Fetch-*` + …)
+1. **Default** headers (whatever the client sends out of the box).
+2. **Firefox User-Agent** override (a current Firefox UA string).
 
-For each request it prints:
+Clients tested: `curl`, `wget`, Python `urllib`, Node `fetch`.
 
-- HTTP status line
-- Relevant Cloudflare response headers (`cf-ray`, `cf-mitigated`,
-  `cf-cache-status`, `server`)
-- The first 300 characters of the response body, whitespace-collapsed
+For each client × header-set combination, the probe records the HTTP
+status code and prints a per-client table.
 
-Exit code `0` if any probe received an HTTP 2xx response; exit code `1`
-otherwise. Useful for running this in CI to detect when the gate is
-lifted.
+Exit code `1` if at least one available client is blocked from default
+access; exit code `0` if every available client fetched the URL with
+default settings.
 
-## Expected output today
+## Example output
 
-All four probes return identically:
+A run on **2026-05-04T20:24Z** produced:
 
 ```
-HTTP 403 Forbidden
-server          : cloudflare
-cf-ray          : <ray id>
-cf-mitigated    : challenge
-content-type    : text/html; charset=UTF-8
-body (first 300 chars, whitespace-collapsed):
-  <!DOCTYPE html><html lang="en-US"><head> ... Just a moment ...
+Target URL : https://registry.color.org/profile-registry/
+Probed at  : 2026-05-04T20:24:54.320Z
+
+Client           Default       Firefox UA
+-------------    ------------  ------------
+curl             200 OK        200 OK
+wget             200 OK        200 OK
+python urllib    403           200 OK
+node fetch       200 OK        200 OK
+
+Verdict: at least one client is blocked with default settings.
+         The bot rule on this hostname is currently selective rather than blanket.
 ```
 
-The `cf-mitigated: challenge` header is Cloudflare's marker for the
-JS-challenge interstitial. The fact that probe (4) — which sends the
-same headers a real Firefox would — also receives this response
-confirms the block is not header-sniffing-based: the challenge
-genuinely requires browser JS execution.
+## Observed history
+
+The rule's behaviour over the period this probe has been in use:
+
+| Date (UTC)            | Behaviour observed                                                                          |
+| --------------------- | ------------------------------------------------------------------------------------------- |
+| 2026-05-04 ~18:16Z    | Blanket block — every Node-fetch probe (no UA, curl-UA, Firefox UA, full Firefox headers) returned `HTTP 403` + `cf-mitigated: challenge`. |
+| 2026-05-04 ~20:20Z    | Mostly relaxed — `curl`, `wget`, Node `fetch`, and Python `urllib` *with* a non-default UA all returned `200`. Only Python `urllib`'s default UA (`Python-urllib/3.X`) was still blocked. |
+
+The two observations are roughly **two hours apart**, on the same IP,
+with no coordination on either side. The earlier behaviour was a
+`cf-mitigated: challenge` JS-interstitial that no HTTP-only client
+could pass; the later behaviour is selective UA-string flagging only.
 
 ## Why this matters
 
@@ -76,12 +89,18 @@ ICC profile files published at `registry.color.org/profile-registry/`
 are reference data for the colour-management ecosystem. Software that
 wants to use those profiles programmatically — colour-management
 applications, validators, mirrors, research and teaching tooling —
-currently cannot fetch them over HTTP without a headless browser
-(Puppeteer / Playwright) or an out-of-band copy.
+needs predictable HTTP-level access.
 
-If the registry is intended to be machine-consumable (which the
-directory-listing format strongly implies), the bot-challenge gate
-should be relaxed for that subdirectory, or for the host as a whole.
+The volatility shown above is the operational risk: even if today's
+rule lets most clients through, a consumer that built against today's
+behaviour may break the next time the rule tightens. A registry that's
+contractually a programmatic data source needs **stable, contractual
+exemption** from bot mitigation for at least the JSON-API and asset
+paths — not "currently lenient scoring."
+
+A draft enhancement proposal for adding a JSON API to the registries,
+together with a permanent bot-rule exemption for those paths, lives in
+the `proposals/` directory of this repo.
 
 ## License
 

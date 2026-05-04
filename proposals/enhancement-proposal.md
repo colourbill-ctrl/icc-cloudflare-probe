@@ -28,10 +28,16 @@ benefit from machine-readable access:
 - Validators, conformance test suites, and academic research code.
 - Mirrors and aggregators (the current ad-hoc workflow is "scrape the
   HTML, hope the layout doesn't change").
-- Browser-based tools that today cannot fetch the registry at all,
-  because Cloudflare's bot challenge gates non-browser HTTP clients
-  (see [`colourbill-ctrl/icc-cloudflare-probe`](https://github.com/colourbill-ctrl/icc-cloudflare-probe)
-  for a minimal reproducer).
+- Browser-based tools and other CDN consumers, whose HTTP-level access
+  to the registry today is gated by a Cloudflare bot rule whose
+  behaviour is observably volatile — the same diagnostic probe shifted
+  from "every Node-fetch attempt blocked with `cf-mitigated: challenge`"
+  to "most clients pass; only Python's default urllib UA is flagged"
+  within roughly two hours on the same IP, with no coordination on
+  either side. See
+  [`colourbill-ctrl/icc-cloudflare-probe`](https://github.com/colourbill-ctrl/icc-cloudflare-probe)
+  for the cross-client diagnostic and a date-stamped record of observed
+  rule behaviour.
 
 A JSON API removes the scraping requirement and gives consumers a
 stable contract.
@@ -208,16 +214,28 @@ All `*.json` and asset URLs MUST serve `Access-Control-Allow-Origin: *`.
 Without it, browser-based consumers cannot fetch from the registry
 directly.
 
-### Bot-challenge exemption
+### Bot-mitigation exemption (permanent commitment)
 
-The Cloudflare bot challenge currently in front of `registry.color.org`
-returns HTTP 403 to every non-browser HTTP client. The challenge MUST be
-exempted for:
+Cloudflare's bot rules in front of `registry.color.org` are observably
+volatile — see the cross-client probe for date-stamped runs. Rule
+behaviour has shifted from "blanket-403 with `cf-mitigated: challenge`"
+to "selective UA-string flagging only" within hours, on the same IP,
+without coordination. Today's pass-list is not necessarily tomorrow's.
+
+For a registry that is contractually a programmatic data source, the
+ICC SHOULD commit to **permanently exempting** the following paths
+from any bot mitigation, regardless of how the rule is otherwise tuned:
 
 - All `*.json` paths.
 - All asset paths (`*.icc`, `*.icm`, `*.txt`, `*.pdf`, …).
 
-If the challenge is needed at all, restrict it to HTML paths.
+The argument is reliability, not "we're blocked right now." Even if
+the current rule is lenient, a consumer that built against today's
+behaviour breaks the next time scoring tightens. Stable contractual
+access is what the JSON API needs to be useful at all.
+
+If a bot challenge is needed elsewhere on the host, restricting it to
+HTML paths is sufficient.
 
 ### Content-Type
 

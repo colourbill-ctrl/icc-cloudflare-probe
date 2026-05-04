@@ -2,118 +2,149 @@
 //
 // icc-cloudflare-probe
 //
-// Minimal reproducer demonstrating that the public ICC profile registry at
-// registry.color.org is currently gated by a Cloudflare bot-challenge that
-// blocks all non-browser HTTP clients.
+// Cross-client diagnostic for the Cloudflare bot rule sitting in front of
+// registry.color.org. Probes one URL with each of curl, wget, python urllib,
+// and Node fetch (whichever are installed), in two modes: default headers
+// and with a Firefox User-Agent override. Reports a per-client status table.
 //
-// Issues GET requests to a single URL with several different header sets and
-// prints the HTTP status + relevant Cloudflare response headers + a body
-// snippet. Exits non-zero if no probe was able to fetch the URL with HTTP 2xx.
+// The bot rule on this hostname is volatile — the same probe's results have
+// shifted between "every client gets 403" and "almost every client gets 200"
+// within a single day. The point of this tool is to give a date-stamped
+// snapshot of which clients fail right now, plus a record (in the README)
+// of what the rule has done historically.
 //
 // Usage:
-//   node probe.mjs                  # default URL
-//   node probe.mjs --url <URL>      # probe a specific URL instead
+//   node probe.mjs                 # default URL, all available clients
+//   node probe.mjs --url <URL>     # probe a specific URL instead
 //   node probe.mjs --help
 
+import { spawnSync } from 'node:child_process';
+
 const DEFAULT_URL = 'https://registry.color.org/profile-registry/';
+const FIREFOX_UA  = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:124.0) Gecko/20100101 Firefox/124.0';
+const TIMEOUT_S   = 20;
 
-const PROBES = [
-  {
-    label:   'bare (no User-Agent override)',
-    headers: {}
-  },
-  {
-    label:   'curl-like',
-    headers: { 'User-Agent': 'curl/8.4.0' }
-  },
-  {
-    label:   'Firefox UA only',
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:124.0) Gecko/20100101 Firefox/124.0'
-    }
-  },
-  {
-    label:   'full Firefox header set',
-    headers: {
-      'User-Agent':                'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:124.0) Gecko/20100101 Firefox/124.0',
-      'Accept':                    'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-      'Accept-Language':           'en-US,en;q=0.5',
-      'Accept-Encoding':           'gzip, deflate, br',
-      'DNT':                       '1',
-      'Connection':                'keep-alive',
-      'Upgrade-Insecure-Requests': '1',
-      'Sec-Fetch-Dest':            'document',
-      'Sec-Fetch-Mode':            'navigate',
-      'Sec-Fetch-Site':            'none',
-      'Sec-Fetch-User':            '?1'
-    }
-  }
+const CLIENTS = [
+  { name: 'curl',          probe: curlProbe         },
+  { name: 'wget',          probe: wgetProbe         },
+  { name: 'python urllib', probe: pythonUrllibProbe },
+  { name: 'node fetch',    probe: nodeFetchProbe    }
 ];
-
-const RELEVANT_HEADERS = [
-  'server',
-  'cf-ray',
-  'cf-mitigated',
-  'cf-cache-status',
-  'content-type',
-  'content-length'
-];
-
-const REQUEST_DELAY_MS = 500;
 
 const args = parseArgs(process.argv.slice(2));
-if (args.help) {
-  printHelp();
-  process.exit(0);
-}
+if (args.help) { printHelp(); process.exit(0); }
 const url = args.url ?? DEFAULT_URL;
 
 console.log(`Target URL : ${url}`);
 console.log(`Probed at  : ${new Date().toISOString()}`);
-console.log(`Probe count: ${PROBES.length}`);
 console.log('');
 
-let okCount = 0;
-for (let i = 0; i < PROBES.length; i++) {
-  if (i > 0) await sleep(REQUEST_DELAY_MS);
-  const ok = await runProbe(url, PROBES[i]);
-  if (ok) okCount++;
+const rows = [];
+for (const client of CLIENTS) {
+  const available = client.probe(url, null, /* detectOnly */ true);
+  if (!available) {
+    rows.push({ name: client.name, available: false });
+    continue;
+  }
+  const def = client.probe(url, null);
+  const fox = client.probe(url, FIREFOX_UA);
+  rows.push({ name: client.name, available: true, def, fox });
 }
 
-console.log(`Summary: ${okCount}/${PROBES.length} probe(s) received HTTP 2xx`);
-process.exit(okCount === 0 ? 1 : 0);
+const NAME_W = Math.max(...CLIENTS.map((c) => c.name.length), 'Client'.length);
+const COL    = 14;
+console.log(`${'Client'.padEnd(NAME_W)}    ${'Default'.padEnd(COL)}${'Firefox UA'.padEnd(COL)}`);
+console.log(`${'-'.repeat(NAME_W)}    ${'-'.repeat(COL - 2).padEnd(COL)}${'-'.repeat(COL - 2).padEnd(COL)}`);
+for (const r of rows) {
+  if (!r.available) {
+    console.log(`${r.name.padEnd(NAME_W)}    (not installed)`);
+    continue;
+  }
+  console.log(`${r.name.padEnd(NAME_W)}    ${fmt(r.def).padEnd(COL)}${fmt(r.fox).padEnd(COL)}`);
+}
+console.log('');
 
-// ─── Probe ──────────────────────────────────────────────────────────────────
+const availableRows = rows.filter((r) => r.available);
+const anyBlocked    = availableRows.some((r) => !is2xx(r.def));
+const allBlocked    = availableRows.every((r) => !is2xx(r.def) && !is2xx(r.fox));
 
-async function runProbe(url, probe) {
-  console.log(`==> ${probe.label}`);
-  let response;
-  try {
-    response = await fetch(url, { headers: probe.headers });
-  } catch (err) {
-    console.log(`    network error: ${err.message}`);
-    console.log('');
-    return false;
-  }
-  console.log(`    HTTP ${response.status} ${response.statusText}`);
-  for (const h of RELEVANT_HEADERS) {
-    const v = response.headers.get(h);
-    if (v) console.log(`    ${h.padEnd(16)}: ${v}`);
-  }
-  const text = await response.text().catch(() => '');
-  const snippet = text.slice(0, 300).replace(/\s+/g, ' ').trim();
-  if (snippet) {
-    console.log(`    body (first 300 chars, whitespace-collapsed):`);
-    console.log(`      ${snippet}${text.length > 300 ? ' …' : ''}`);
-  }
-  console.log('');
-  return response.status >= 200 && response.status < 300;
+if (allBlocked) {
+  console.log('Verdict: every available client was blocked, including with a Firefox User-Agent.');
+  process.exit(1);
+}
+if (anyBlocked) {
+  console.log('Verdict: at least one client is blocked with default settings.');
+  console.log('         The bot rule on this hostname is currently selective rather than blanket.');
+  process.exit(1);
+}
+console.log('Verdict: all available clients fetched the URL with default settings.');
+console.log('         The bot rule on this hostname is currently inactive (or scoring lenient).');
+process.exit(0);
+
+// ─── Probes ────────────────────────────────────────────────────────────────
+
+function curlProbe(url, ua, detectOnly) {
+  if (detectOnly) return cmdAvailable('curl', ['--version']);
+  const cmdArgs = ['-sS', '-o', '/dev/null', '-w', '%{http_code}', '--max-time', String(TIMEOUT_S)];
+  if (ua) cmdArgs.push('-A', ua);
+  cmdArgs.push(url);
+  const r = spawnSync('curl', cmdArgs, { encoding: 'utf8' });
+  return (r.stdout || '').trim() || 'ERR';
 }
 
-// ─── Misc ───────────────────────────────────────────────────────────────────
+function wgetProbe(url, ua, detectOnly) {
+  if (detectOnly) return cmdAvailable('wget', ['--version']);
+  const cmdArgs = ['-q', '-O', '/dev/null', '--server-response', `--timeout=${TIMEOUT_S}`];
+  if (ua) cmdArgs.push(`--user-agent=${ua}`);
+  cmdArgs.push(url);
+  const r = spawnSync('wget', cmdArgs, { encoding: 'utf8' });
+  // wget --server-response prints HTTP status lines to stderr; grab the
+  // first one (the URL itself isn't redirected to a different status path).
+  const m = (r.stderr || '').match(/HTTP\/[\d.]+\s+(\d+)/);
+  return m ? m[1] : 'ERR';
+}
 
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
+function pythonUrllibProbe(url, ua, detectOnly) {
+  if (detectOnly) return cmdAvailable('python3', ['--version']);
+  const headersExpr = ua ? `, headers={'User-Agent': ${JSON.stringify(ua)}}` : '';
+  const code = `import urllib.request as u, urllib.error as e
+try:
+    req = u.Request(${JSON.stringify(url)}${headersExpr})
+    print(u.urlopen(req, timeout=${TIMEOUT_S}).status)
+except e.HTTPError as ex:
+    print(ex.code)
+except Exception:
+    print('ERR')`;
+  const r = spawnSync('python3', ['-c', code], { encoding: 'utf8' });
+  return (r.stdout || '').trim() || 'ERR';
+}
+
+function nodeFetchProbe(url, ua, detectOnly) {
+  if (detectOnly) return cmdAvailable('node', ['--version']);
+  const opts = ua
+    ? `{ headers: { 'User-Agent': ${JSON.stringify(ua)} }, signal: AbortSignal.timeout(${TIMEOUT_S * 1000}) }`
+    : `{ signal: AbortSignal.timeout(${TIMEOUT_S * 1000}) }`;
+  const code = `fetch(${JSON.stringify(url)}, ${opts}).then((r) => console.log(r.status)).catch(() => console.log('ERR'))`;
+  const r = spawnSync('node', ['-e', code], { encoding: 'utf8' });
+  return (r.stdout || '').trim() || 'ERR';
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────
+
+function cmdAvailable(cmd, args) {
+  const r = spawnSync(cmd, args, { encoding: 'utf8' });
+  return r.status === 0;
+}
+
+function is2xx(code) {
+  const n = Number(code);
+  return Number.isFinite(n) && n >= 200 && n < 300;
+}
+
+function fmt(code) {
+  if (is2xx(code)) return `${code} OK`;
+  if (code === 'ERR') return 'network err';
+  return String(code);
 }
 
 function parseArgs(argv) {
@@ -135,19 +166,21 @@ function parseArgs(argv) {
 }
 
 function printHelp() {
-  console.log(`icc-cloudflare-probe — demonstrate Cloudflare blocking on registry.color.org
+  console.log(`icc-cloudflare-probe — cross-client diagnostic for registry.color.org
+
+Probes ${DEFAULT_URL} (or --url) with each available client (curl, wget,
+python urllib, node fetch), with default headers and again with a Firefox
+User-Agent. Prints a per-client status table.
 
 Usage:
-  node probe.mjs                  Probe the default URL with several header sets
+  node probe.mjs                  Probe the default URL with all available clients
   node probe.mjs --url <URL>      Probe a specific URL instead
   node probe.mjs --help           This help
 
 Default URL: ${DEFAULT_URL}
 
-Requires Node >= 18 (uses global fetch).
-
 Exit code:
-  0  at least one probe successfully fetched the URL (HTTP 2xx)
-  1  no probe got through (typically because of the Cloudflare challenge)
+  0  all available clients fetched with default settings
+  1  at least one client was blocked
 `);
 }

@@ -15,10 +15,15 @@ profile library. While building it I ran into two related issues:
 
 1. The registry has no machine-readable surface, so consumers have to
    parse HTML and guess at download links.
-2. Even that scraping doesn't currently work, because
-   `registry.color.org` sits behind a Cloudflare bot challenge that
-   returns HTTP 403 to all non-browser clients. A minimal reproducer is
-   published at [`colourbill-ctrl/icc-cloudflare-probe`](https://github.com/colourbill-ctrl/icc-cloudflare-probe).
+2. Even at HTTP level, access is unreliable. A Cloudflare bot rule on
+   `registry.color.org` blocks some clients (Python `urllib`'s default
+   User-Agent at minimum) and during the development of the probe its
+   behaviour shifted substantially within a single day — from "every
+   non-browser client returns HTTP 403 with `cf-mitigated: challenge`"
+   to "almost everything passes; only Python's default UA is flagged."
+   A cross-client diagnostic and a date-stamped record of observed rule
+   behaviour is published at
+   [`colourbill-ctrl/icc-cloudflare-probe`](https://github.com/colourbill-ctrl/icc-cloudflare-probe).
 
 In a recent exchange with Adam Dewitz, the suggested
 direction was to expose JSON endpoints with the registry metadata plus
@@ -49,10 +54,11 @@ A few concrete consumer scenarios that are blocked or impractical today:
   consistency checks, and report results — useful both for the ICC's
   own quality assurance and for downstream toolmakers.
 
-- **Browser-based tools** can fetch entries
-  directly from the registry. Today they cannot — both the missing API
-  and the Cloudflare gate block them. Under this proposal they're
-  unblocked.
+- **Browser-based tools and other CDN consumers** can rely on stable
+  HTTP-level access. Today the bot-mitigation rule on the host is
+  selective and (as observed) volatile, so a consumer that built
+  against today's behaviour may break the next time the rule
+  re-tightens. A permanent path-based exemption fixes this.
 
 - **Mirrors and academic research** can crawl efficiently against a
   known schema rather than reverse-engineering whatever HTML structure
@@ -162,12 +168,14 @@ A few things that are easy to forget but blocking for real consumers:
    JSON files and the asset files. Cheap one-line config change at the
    CDN.
 
-2. **Bot-challenge exemption.** The Cloudflare challenge currently in
-   place stops every non-browser client cold. For the JSON API to be
-   useful at all, JSON paths and asset paths need to be exempted from
-   the challenge. (HTML paths could remain gated if the working groups
-   prefer — this proposal doesn't require lifting the challenge
-   entirely.)
+2. **Permanent bot-mitigation exemption for JSON + asset paths.**
+   Cloudflare's bot rule on the host is volatile (see the probe's
+   history table). Even if today's rule is lenient, a consumer built
+   against today's behaviour may break the next time scoring tightens.
+   The ICC should commit to a permanent path-based exemption for
+   `*.json` and asset paths, so the JSON API has a stable HTTP-level
+   contract. (HTML paths could remain bot-gated if the working groups
+   prefer — this proposal doesn't require lifting the rule entirely.)
 
 3. **Asset integrity.** Each asset URL is published with a SHA-256 hash.
    This is the contract that makes mirrors safe to trust.
@@ -185,8 +193,8 @@ to emit JSON in parallel. Concretely:
 - One pass to compute SHA-256 over each referenced asset at build time
   (cacheable against mtime).
 - Five JSON Schema files authored once.
-- One Cloudflare configuration change for CORS and bot-challenge
-  exemption.
+- One Cloudflare configuration change for CORS and a permanent
+  path-based bot-mitigation exemption.
 
 No runtime infrastructure. No new dependencies. No change to where data
 lives, who owns it, or how submissions work. The HTML pages remain
@@ -246,10 +254,12 @@ If the working groups are receptive, I'd like to:
 3. Provide a worked example with the existing ECI_FOGRA39 data so the
    JSON output can be reviewed alongside the current HTML.
 
-The Cloudflare-blocking issue is a precondition for any of this being
-useful — that needs to be resolved first or in parallel, regardless of
-whether the JSON proposal moves forward. The icc-cloudflare-probe
-repository is a minimal reproducer.
+The bot-mitigation volatility is a precondition for any of this being
+useful — committing to a permanent path-based exemption (for `*.json`
+and asset paths) needs to happen first or in parallel, regardless of
+whether the JSON proposal otherwise moves forward. The
+icc-cloudflare-probe repository contains the cross-client diagnostic
+and a date-stamped record of observed rule behaviour.
 
 I'd welcome the chance to present this in either working group's next
 meeting.
